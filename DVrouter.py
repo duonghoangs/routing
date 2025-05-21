@@ -1,126 +1,111 @@
 ####################################################
 # DVrouter.py
-# Name: <Your Name>
-# HUID: <Your HUID>
+# Name: Lương Quang Huy
+# HUID: 23021572
 #####################################################
 
-import json
 from router import Router
 from packet import Packet
+import json
 
 class DVrouter(Router):
-    """Distance vector routing protocol implementation."""
-
     def __init__(self, addr, heartbeat_time):
-        # Khởi tạo base class (chỉ nhận addr)
         super().__init__(addr)
         self.heartbeat_time = heartbeat_time
-        self.last_time = 0
+        self.last_broadcast = 0
+        self.MAX_COST = 16
 
-        # port -> cost đến neighbor
-        self.neighbor_costs = {}
-        # port -> neighbor address
-        self.neighbor_addrs = {}
-        # neighbor address -> last advertised distance vector
+        # Maps port -> link cost
+        self.link_costs = {}
+
+        # Maps port -> neighbor address
+        self.port_to_neighbor = {}
+
+        # Maps neighbor address -> their last known distance vector
         self.neighbor_vectors = {}
 
-        # distance vector của chính mình: dest_addr -> cost
-        self.distances = {self.addr: 0}
-        # forwarding table: dest_addr -> out_port
-        self.forwarding = {}
+        # This router's distance vector and forwarding table
+        self.distance_vector = {self.addr: 0}
+        self.forwarding_table = {}
 
-        # broadcast vector khởi tạo
-        self._broadcast_vector()
+    def send_distance_vector(self):
+        """Send this router's distance vector to all neighbors."""
+        payload = json.dumps(self.distance_vector)
+        for port in self.link_costs:
+            packet = Packet(kind=Packet.ROUTING, src_addr=self.addr, dst_addr=None, content=payload)
+            self.send(port, packet)
 
-    def _broadcast_vector(self):
-        """Gửi distance vector hiện tại đến tất cả neighbor."""
-        payload = json.dumps({"vector": self.distances})
-        for port in self.neighbor_addrs:
-            pkt = Packet()
-            pkt.kind = Packet.ROUTING
-            pkt.src_addr = self.addr
-            pkt.dst_addr = None
-            pkt.content = payload
-            self.send(port, pkt)
+    def update_routing(self):
+        """Recalculate distance vector and forwarding table."""
+        updated = False
+        new_dv = {self.addr: 0}
+        new_ft = {}
 
-    def _recompute(self):
-        """Bellman–Ford: tính lại distances & forwarding table."""
-        # tập mọi đích do neighbors quảng bá
-        all_dests = set()
-        for vec in self.neighbor_vectors.values():
-            all_dests.update(vec.keys())
-        all_dests.discard(self.addr)
+        # Direct neighbors
+        for port, cost in self.link_costs.items():
+            neighbor = self.port_to_neighbor[port]
+            if cost < new_dv.get(neighbor, self.MAX_COST + 1):
+                new_dv[neighbor] = cost
+                new_ft[neighbor] = port
 
-        new_dist = {self.addr: 0}
-        for dest in all_dests:
-            best = float('inf')
-            for port, nei_addr in self.neighbor_addrs.items():
-                cost_to_nei = self.neighbor_costs[port]
-                nei_vec = self.neighbor_vectors.get(nei_addr, {})
-                c = nei_vec.get(dest, float('inf'))
-                best = min(best, cost_to_nei + c)
-            if best < float('inf'):
-                new_dist[dest] = best
-
-        # xây forwarding mới
-        new_fwd = {}
-        for dest, dist in new_dist.items():
-            if dest == self.addr:
+        # Indirect paths via neighbors' vectors
+        for port, cost in self.link_costs.items():
+            neighbor = self.port_to_neighbor[port]
+            if neighbor not in self.neighbor_vectors:
                 continue
-            for port, nei_addr in self.neighbor_addrs.items():
-                cost_to_nei = self.neighbor_costs[port]
-                nei_vec = self.neighbor_vectors.get(nei_addr, {})
-                if nei_vec.get(dest, float('inf')) + cost_to_nei == dist:
-                    new_fwd[dest] = port
-                    break
+            for dest, neighbor_cost in self.neighbor_vectors[neighbor].items():
+                if dest == self.addr:
+                    continue
+                total_cost = min(self.MAX_COST, cost + neighbor_cost)
+                if total_cost < new_dv.get(dest, self.MAX_COST + 1):
+                    new_dv[dest] = total_cost
+                    new_ft[dest] = port
 
-        changed = (new_dist != self.distances)
-        if changed:
-            self.distances = new_dist
-            self.forwarding = new_fwd
-        return changed
+        if new_dv != self.distance_vector or new_ft != self.forwarding_table:
+            self.distance_vector = new_dv
+            self.forwarding_table = new_ft
+            updated = True
+
+        return updated
 
     def handle_packet(self, port, packet):
-        """Xử lý gói đến: traceroute hoặc routing."""
-        if packet.is_traceroute:
-            # data packet: forward theo bảng
-            out = self.forwarding.get(packet.dst_addr)
-            if out is not None:
-                self.send(out, packet)
+        if packet.kind == Packet.ROUTING:
+            try:
+                vector = json.loads(packet.content)
+            except json.JSONDecodeError:
+                return
+            self.neighbor_vectors[packet.src_addr] = vector
+            if self.update_routing():
+                self.send_distance_vector()
         else:
-            # routing packet: neighbor gửi distance vector
-            data = json.loads(packet.content)
-            vec = data.get("vector", {})
-            src = packet.src_addr
-            if self.neighbor_vectors.get(src) != vec:
-                self.neighbor_vectors[src] = vec
-                if self._recompute():
-                    self._broadcast_vector()
+            # Data packet (traceroute or real traffic)
+            dst = packet.dst_addr
+            if dst in self.forwarding_table:
+                out_port = self.forwarding_table[dst]
+                self.send(out_port, packet)
 
     def handle_new_link(self, port, endpoint, cost):
-        """Khi có link mới up."""
-        self.neighbor_addrs[port] = endpoint
-        self.neighbor_costs[port] = cost
-        # khởi vector neighbor rỗng cho đến khi nhận được
-        self.neighbor_vectors.setdefault(endpoint, {})
-        if self._recompute():
-            self._broadcast_vector()
+        self.link_costs[port] = cost
+        self.port_to_neighbor[port] = endpoint
+        if cost < self.distance_vector.get(endpoint, self.MAX_COST + 1):
+            self.distance_vector[endpoint] = cost
+            self.forwarding_table[endpoint] = port
+        if self.update_routing():
+            self.send_distance_vector()
 
     def handle_remove_link(self, port):
-        """Khi link down."""
-        if port in self.neighbor_addrs:
-            nei = self.neighbor_addrs.pop(port)
-            self.neighbor_costs.pop(port, None)
-            self.neighbor_vectors.pop(nei, None)
-        if self._recompute():
-            self._broadcast_vector()
+        if port in self.link_costs:
+            neighbor = self.port_to_neighbor.pop(port, None)
+            self.link_costs.pop(port)
+            if neighbor:
+                self.neighbor_vectors.pop(neighbor, None)
+            if self.update_routing():
+                self.send_distance_vector()
 
     def handle_time(self, time_ms):
-        """Heartbeat: gửi lại vector dù không thay đổi."""
-        if time_ms - self.last_time >= self.heartbeat_time:
-            self.last_time = time_ms
-            self._broadcast_vector()
+        if time_ms - self.last_broadcast >= self.heartbeat_time:
+            self.last_broadcast = time_ms
+            self.send_distance_vector()
 
     def __repr__(self):
-        return (f"DVrouter(addr={self.addr}, "
-                f"dist={self.distances}, fwd={self.forwarding})")
+        return f"DVrouter(addr={self.addr}, dv={self.distance_vector})"
